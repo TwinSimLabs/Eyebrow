@@ -372,11 +372,11 @@ class MainController:
     
     def handle_import(self) -> None:
         """Handle Import button click with parallel import optimization."""
-        directory = QFileDialog.getExistingDirectory(
+        directory = Path(QFileDialog.getExistingDirectory(
             self.view,
             "Select Folder to Import",
             str(Path.home())
-        )
+        ))
         
         if not directory:
             return

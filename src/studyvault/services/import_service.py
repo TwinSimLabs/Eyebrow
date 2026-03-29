@@ -11,7 +11,7 @@ from typing import List, Set
 import logging
 
 from studyvault.models.item import Item
-from studyvault.utils.file_util import FileUtil
+import studyvault.utils.file_util as FileUtil
 from studyvault.utils.logger import get_logger
 
 logger = get_logger(__name__)

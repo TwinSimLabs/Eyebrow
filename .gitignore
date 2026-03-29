@@ -34,3 +34,12 @@ build/
 
 .csv
 .xlsx
+
+uv.lock
+pyproject.toml
+.gitignore
+*.csv
+tests
+
+__pycache__
+*.pyc
