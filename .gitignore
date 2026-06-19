@@ -34,3 +34,7 @@ build/
 
 .csv
 .xlsx
+
+.gitignore
+CODE_FUNCTIONALITY_BREAKDOWN.MD
+sample_data/*
