@@ -69,7 +69,7 @@ class ImportService:
         
         # Scan for files (parallel or sequential)
         if parallel:
-            files = FileUtil.scan_directory_parallel(
+            files = FileUtil.scan_directory_async(
                 directory, 
                 self.processed_paths,
                 max_workers=max_workers

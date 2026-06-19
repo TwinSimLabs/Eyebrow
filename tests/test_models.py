@@ -17,11 +17,11 @@ class TestItemRating:
         assert item.rating == 5
     
     def test_rating_clamps_lower_bound(self):
-        """Test rating clamped to min 1 (if non-zero)."""
+        """Test rating clamped to min 0."""
         item = Item("Test", "Cat", "pdf")
         item.set_rating(-5)
         
-        assert item.rating == 1
+        assert item.rating == 0
     
     def test_rating_allows_zero(self):
         """Test rating can be 0 (unrated)."""
