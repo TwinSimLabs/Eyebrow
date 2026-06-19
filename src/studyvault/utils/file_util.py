@@ -13,6 +13,14 @@ from threading import Thread, Lock
 from queue import Queue, Empty
 import logging
 import stat as stat_module
+import sys
+
+try:
+    import win32file
+    import win32con
+    _WIN32_AVAILABLE = sys.platform == 'win32'
+except ImportError:
+    _WIN32_AVAILABLE = False
 
 from studyvault.utils.logger import get_logger
 
@@ -225,33 +233,49 @@ class FileUtil:
                             continue
                         processed_paths.add(dir_str)
                     
-                    # Scan directory
-                    for item in dir_path.iterdir():
+                    # Scan directory using Win32 API (Windows) or pathlib fallback
+                    if _WIN32_AVAILABLE:
+                        pattern = str(dir_path / "*")
                         try:
-                            if item.is_file():
-                                ext = item.suffix.lower() if item.suffix else ""
-                                
-                                if ext not in FileUtil.SUPPORTED_EXTENSIONS:
+                            for find_data in win32file.FindFilesIterator(pattern):
+                                name = find_data[8]  # cFileName
+                                if name in ('.', '..'):
                                     continue
-                                
-                                path_str = str(item.resolve())
-                                
-                                # Thread-safe check and add to processed
-                                with lock:
-                                    if path_str not in processed_paths:
-                                        found_files.append(item)
-                                        processed_paths.add(path_str)
-                            
-                            elif item.is_dir():
-                                # Enqueue subdirectory for another worker
-                                work_queue.put(item)
-                        
-                        except (PermissionError, OSError):
-                            continue
-                        
-                        if len(found_files) % 100 == 0 and len(found_files) > 0:
-                            if logger.isEnabledFor(logging.DEBUG):
-                                logger.debug(f"Found {len(found_files)} files so far...")
+                                attrs = find_data[0]  # dwFileAttributes (free, no syscall)
+                                full_path = dir_path / name
+                                if attrs & win32con.FILE_ATTRIBUTE_DIRECTORY:
+                                    work_queue.put(full_path)
+                                else:
+                                    ext = full_path.suffix.lower()
+                                    if ext not in FileUtil.SUPPORTED_EXTENSIONS:
+                                        continue
+                                    path_str = str(full_path)
+                                    with lock:
+                                        if path_str not in processed_paths:
+                                            found_files.append(full_path)
+                                            processed_paths.add(path_str)
+                        except Exception:
+                            pass
+                    else:
+                        for item in dir_path.iterdir():
+                            try:
+                                if item.is_file():
+                                    ext = item.suffix.lower() if item.suffix else ""
+                                    if ext not in FileUtil.SUPPORTED_EXTENSIONS:
+                                        continue
+                                    path_str = str(item.resolve())
+                                    with lock:
+                                        if path_str not in processed_paths:
+                                            found_files.append(item)
+                                            processed_paths.add(path_str)
+                                elif item.is_dir():
+                                    work_queue.put(item)
+                            except (PermissionError, OSError):
+                                continue
+                    
+                    if len(found_files) % 100 == 0 and len(found_files) > 0:
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"Found {len(found_files)} files so far...")
                 
                 except PermissionError:
                     pass
