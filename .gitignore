@@ -33,4 +33,7 @@ build/
 *.egg-info/
 
 .csv
+!benchmark.csv
 .xlsx
+sample_data/
+CODE_FUNCTIONALITY_BREAKDOWN.md
