@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import os
 import random
 import shutil
@@ -192,6 +193,35 @@ def measure_memory_stop(enabled: bool) -> Optional[float]:
     return None
 
 
+def _trim_windows_working_set() -> bool:
+    if os.name != "nt":
+        return False
+
+    try:
+        import ctypes
+
+        handle = ctypes.windll.kernel32.GetCurrentProcess()
+        return bool(ctypes.windll.psapi.EmptyWorkingSet(handle))
+    except Exception:
+        return False
+
+
+def clear_suite_caches(settle_seconds: float = 0.05) -> str:
+    gc.collect()
+
+    if TRACEMALLOC_AVAILABLE and tracemalloc.is_tracing():
+        tracemalloc.stop()
+
+    trimmed = _trim_windows_working_set()
+
+    if settle_seconds > 0:
+        time.sleep(settle_seconds)
+
+    if trimmed:
+        return "gc + working-set trim"
+    return "gc only"
+
+
 # ---------------------------
 # Benchmark execution
 # ---------------------------
@@ -211,75 +241,98 @@ def run_benchmark_once(
     dataset_dir = work_dir / f"dataset_{scale}_{profile}_rep{rep}"
     dataset_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1) Generate dataset (optionally excluded from timing)
-    if pregenerate:
-        print(f"    Pre-generating {scale} files... ", end="", flush=True)
-        generate_dataset(dataset_dir, scale, profile)
-        print("✓")
+    print(f"    Cache reset before run: {clear_suite_caches()}")
 
-    # 2) Import with specified mode
-    importer = ImportService()
-    mem_on = measure_memory_start(measure_mem)
-    
-    t0 = time.perf_counter()
-    
-    if not pregenerate:
-        generate_dataset(dataset_dir, scale, profile)
-    
-    # Select import method based on mode
-    if import_mode == "parallel":
-        items = importer.import_from_directory(dataset_dir, parallel=True, max_workers=4)
-    elif import_mode == "buffered":
-        items = importer.import_from_directory_buffered(dataset_dir, batch_size=100, parallel=False)
-    elif import_mode == "optimized":
-        items = importer.import_from_directory_optimized(dataset_dir, batch_size=100, max_workers=4)
-    else:  # standard
-        items = importer.import_from_directory(dataset_dir)
-    
-    t1 = time.perf_counter()
+    importer = None
+    search = None
+    repo = None
+    items: List[Item] = []
+    item_map: Dict[str, Item] = {}
+    search_times: List[float] = []
+    mem_on = False
 
-    # 3) Index
-    search = SearchService()
-    t2 = time.perf_counter()
-    search.build_index(items)
-    t3 = time.perf_counter()
+    try:
+        # 1) Generate dataset (optionally excluded from timing)
+        if pregenerate:
+            print(f"    Pre-generating {scale} files... ", end="", flush=True)
+            generate_dataset(dataset_dir, scale, profile)
+            print("✓")
 
-    # 4) Search (average over queries)
-    item_map = {it.id: it for it in items}
-    search_times = []
-    for q in search_queries:
-        s0 = time.perf_counter()
-        _ = search.search(q, item_map)
-        s1 = time.perf_counter()
-        search_times.append(_ms(s0, s1))
-    avg_search_ms = sum(search_times) / max(1, len(search_times))
+        # 2) Import with specified mode
+        importer = ImportService()
+        mem_on = measure_memory_start(measure_mem)
 
-    # 5) Save / Load
-    repo = LibraryRepository(data_file=data_dir / f"library_{scale}_{profile}_rep{rep}.dat")
+        t0 = time.perf_counter()
 
-    t4 = time.perf_counter()
-    repo.save_library(LibraryData(items=items))
-    t5 = time.perf_counter()
+        if not pregenerate:
+            generate_dataset(dataset_dir, scale, profile)
 
-    t6 = time.perf_counter()
-    _ = repo.load_library()
-    t7 = time.perf_counter()
+        # Select import method based on mode
+        if import_mode == "parallel":
+            items = importer.import_from_directory(dataset_dir, parallel=True, max_workers=4)
+        elif import_mode == "buffered":
+            items = importer.import_from_directory_buffered(dataset_dir, batch_size=100, parallel=False)
+        elif import_mode == "optimized":
+            items = importer.import_from_directory_optimized(dataset_dir, batch_size=100, max_workers=4)
+        else:  # standard
+            items = importer.import_from_directory(dataset_dir)
 
-    peak_mb = measure_memory_stop(mem_on)
+        t1 = time.perf_counter()
 
-    return BenchResult(
-        scale=scale,
-        profile=profile,
-        rep=rep,
-        imported=len(items),
-        t_import_ms=_ms(t0, t1),
-        t_index_ms=_ms(t2, t3),
-        t_search_avg_ms=avg_search_ms,
-        t_save_ms=_ms(t4, t5),
-        t_load_ms=_ms(t6, t7),
-        import_mode=import_mode,
-        peak_mb=peak_mb
-    )
+        # 3) Index
+        search = SearchService()
+        t2 = time.perf_counter()
+        search.build_index(items)
+        t3 = time.perf_counter()
+
+        # 4) Search (average over queries)
+        item_map = {it.id: it for it in items}
+        for q in search_queries:
+            s0 = time.perf_counter()
+            _ = search.search(q, item_map)
+            s1 = time.perf_counter()
+            search_times.append(_ms(s0, s1))
+        avg_search_ms = sum(search_times) / max(1, len(search_times))
+
+        # 5) Save / Load
+        repo = LibraryRepository(data_file=data_dir / f"library_{scale}_{profile}_rep{rep}.dat")
+
+        t4 = time.perf_counter()
+        repo.save_library(LibraryData(items=items))
+        t5 = time.perf_counter()
+
+        t6 = time.perf_counter()
+        _ = repo.load_library()
+        t7 = time.perf_counter()
+
+        peak_mb = measure_memory_stop(mem_on)
+        mem_on = False
+
+        return BenchResult(
+            scale=scale,
+            profile=profile,
+            rep=rep,
+            imported=len(items),
+            t_import_ms=_ms(t0, t1),
+            t_index_ms=_ms(t2, t3),
+            t_search_avg_ms=avg_search_ms,
+            t_save_ms=_ms(t4, t5),
+            t_load_ms=_ms(t6, t7),
+            import_mode=import_mode,
+            peak_mb=peak_mb,
+        )
+    finally:
+        if TRACEMALLOC_AVAILABLE and tracemalloc.is_tracing():
+            tracemalloc.stop()
+
+        del item_map
+        del search_times
+        del items
+        del repo
+        del search
+        del importer
+
+        print(f"    Cache reset after run: {clear_suite_caches()}")
 
 
 # ---------------------------

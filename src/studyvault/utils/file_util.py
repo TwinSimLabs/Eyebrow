@@ -9,8 +9,18 @@ Supports parallel scanning for large directory trees.
 from pathlib import Path
 from typing import List, Set
 from concurrent.futures import ThreadPoolExecutor
+from threading import Thread, Lock
+from queue import Queue, Empty
 import logging
 import stat as stat_module
+import sys
+
+try:
+    import win32file
+    import win32con
+    _WIN32_AVAILABLE = sys.platform == 'win32'
+except ImportError:
+    _WIN32_AVAILABLE = False
 
 from studyvault.utils.logger import get_logger
 
@@ -168,6 +178,131 @@ class FileUtil:
                         except Exception as e:
                             if logger.isEnabledFor(logging.ERROR):
                                 logger.error(f"Error in parallel scan: {e}")
+        
+        except PermissionError:
+            if logger.isEnabledFor(logging.WARNING):
+                logger.warning(f"Cannot access directory: {directory}")
+        
+        return found_files
+    
+    @staticmethod
+    def scan_directory_async(
+        directory: Path,
+        processed_paths: Set[str],
+        max_workers: int = 4
+    ) -> List[Path]:
+        """
+        Master-worker directory scanning using thread queue for full-tree parallelism.
+        
+        Uses sentinel-based exit: no timeout overhead, workers block cleanly until
+        explicitly signaled to exit after all work is complete.
+        
+        Args:
+            directory: Root directory to scan
+            processed_paths: Set of already-processed paths (protected by lock)
+            max_workers: Number of worker threads (default: 4)
+        
+        Returns:
+            List of Path objects for all found files
+        """
+        found_files: List[Path] = []
+        
+        if directory is None or not directory.exists() or not directory.is_dir():
+            if logger.isEnabledFor(logging.WARNING):
+                logger.warning(f"Invalid directory: {directory}")
+            return found_files
+        
+        work_queue: Queue = Queue()
+        lock = Lock()
+        sentinel = object()  # Unique sentinel to signal worker exit
+        
+        def worker():
+            """Worker thread: pop dirs from queue, scan, enqueue subdirs, collect files."""
+            while True:
+                dir_path = work_queue.get()  # Block until item available (no timeout)
+                
+                if dir_path is sentinel:  # Exit signal
+                    break
+                
+                try:
+                    # Check if already processed (thread-safe)
+                    with lock:
+                        dir_str = str(dir_path)
+                        if dir_str in processed_paths:
+                            work_queue.task_done()
+                            continue
+                        processed_paths.add(dir_str)
+                    
+                    # Scan directory using Win32 API (Windows) or pathlib fallback
+                    if _WIN32_AVAILABLE:
+                        pattern = str(dir_path / "*")
+                        try:
+                            for find_data in win32file.FindFilesIterator(pattern):
+                                name = find_data[8]  # cFileName
+                                if name in ('.', '..'):
+                                    continue
+                                attrs = find_data[0]  # dwFileAttributes (free, no syscall)
+                                full_path = dir_path / name
+                                if attrs & win32con.FILE_ATTRIBUTE_DIRECTORY:
+                                    work_queue.put(full_path)
+                                else:
+                                    ext = full_path.suffix.lower()
+                                    if ext not in FileUtil.SUPPORTED_EXTENSIONS:
+                                        continue
+                                    path_str = str(full_path)
+                                    with lock:
+                                        if path_str not in processed_paths:
+                                            found_files.append(full_path)
+                                            processed_paths.add(path_str)
+                        except Exception:
+                            pass
+                    else:
+                        for item in dir_path.iterdir():
+                            try:
+                                if item.is_file():
+                                    ext = item.suffix.lower() if item.suffix else ""
+                                    if ext not in FileUtil.SUPPORTED_EXTENSIONS:
+                                        continue
+                                    path_str = str(item.resolve())
+                                    with lock:
+                                        if path_str not in processed_paths:
+                                            found_files.append(item)
+                                            processed_paths.add(path_str)
+                                elif item.is_dir():
+                                    work_queue.put(item)
+                            except (PermissionError, OSError):
+                                continue
+                    
+                    if len(found_files) % 100 == 0 and len(found_files) > 0:
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"Found {len(found_files)} files so far...")
+                
+                except PermissionError:
+                    pass
+                finally:
+                    work_queue.task_done()
+        
+        try:
+            # Enqueue root directory
+            work_queue.put(directory)
+            
+            # Create and start worker threads
+            threads = []
+            for _ in range(max_workers):
+                t = Thread(target=worker, daemon=False)
+                t.start()
+                threads.append(t)
+            
+            # Wait for all work to complete (all .task_done() calls matched)
+            work_queue.join()
+            
+            # Signal workers to exit (send sentinel for each worker)
+            for _ in range(max_workers):
+                work_queue.put(sentinel)
+            
+            # Wait for all threads to finish
+            for t in threads:
+                t.join()
         
         except PermissionError:
             if logger.isEnabledFor(logging.WARNING):
